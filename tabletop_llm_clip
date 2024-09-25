@@ -1,0 +1,144 @@
+import pybullet as p
+import pybullet_data
+import time
+import numpy as np
+from PIL import Image
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, CLIPProcessor, CLIPModel
+
+# PyBullet setup
+physicsClient = p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+p.setGravity(0, 0, -9.81)
+
+# Load basic components (plane, table, robot)
+planeId = p.loadURDF("plane.urdf")
+tableId = p.loadURDF("table/table.urdf", [0, 0, 0])
+robotStartPos = [0, 0, 0.6]
+robotStartOrientation = p.getQuaternionFromEuler([0, 0, 0])
+robotId = p.loadURDF("kuka_iiwa/model.urdf", robotStartPos, robotStartOrientation, useFixedBase=True)
+
+# Object setup: cubes and cylinder
+# Define initial positions and sizes for the objects
+red_cube_pos = [0.2, 0.1, 0.65]  # position above the table
+blue_cube_pos = [0.1, -0.1, 0.65]
+blue_cylinder_pos = [0.3, 0.0, 0.65]
+cube_size = 0.05  # cube dimension (0.05m x 0.05m x 0.05m)
+cylinder_radius = 0.03
+cylinder_height = 0.05
+
+# Create cubes and cylinder using collision shapes and visual shapes
+red_cube_id = p.createCollisionShape(p.GEOM_BOX, halfExtents=[cube_size/2, cube_size/2, cube_size/2])
+blue_cube_id = p.createCollisionShape(p.GEOM_BOX, halfExtents=[cube_size/2, cube_size/2, cube_size/2])
+blue_cylinder_id = p.createCollisionShape(p.GEOM_CYLINDER, radius=cylinder_radius, height=cylinder_height)
+
+# Attach visual shapes (for color representation)
+red_cube_visual_id = p.createVisualShape(p.GEOM_BOX, halfExtents=[cube_size/2, cube_size/2, cube_size/2], rgbaColor=[1, 0, 0, 1])
+blue_cube_visual_id = p.createVisualShape(p.GEOM_BOX, halfExtents=[cube_size/2, cube_size/2, cube_size/2], rgbaColor=[0, 0, 1, 1])
+blue_cylinder_visual_id = p.createVisualShape(p.GEOM_CYLINDER, radius=cylinder_radius, length=cylinder_height, rgbaColor=[0, 0, 1, 1])
+
+# Load the objects into the scene
+red_cube_uid = p.createMultiBody(baseMass=1, baseCollisionShapeIndex=red_cube_id, baseVisualShapeIndex=red_cube_visual_id, basePosition=red_cube_pos)
+blue_cube_uid = p.createMultiBody(baseMass=1, baseCollisionShapeIndex=blue_cube_id, baseVisualShapeIndex=blue_cube_visual_id, basePosition=blue_cube_pos)
+blue_cylinder_uid = p.createMultiBody(baseMass=1, baseCollisionShapeIndex=blue_cylinder_id, baseVisualShapeIndex=blue_cylinder_visual_id, basePosition=blue_cylinder_pos)
+
+# Set up LLaMA model (LLM)
+llama_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B-Instruct")
+llama_model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3.1-8B-Instruct", torch_dtype=torch.float16, device_map="auto")
+
+# Set up CLIP model (for scene verification)
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+# Generate robot actions using LLaMA (LLM)
+def generate_robot_actions(input_text):
+    inputs = llama_tokenizer(input_text, return_tensors="pt").to(llama_model.device)
+    outputs = llama_model.generate(**inputs, max_length=100)
+    action_sequence = llama_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return action_sequence
+
+# Parse actions into smaller tasks
+def parse_actions(action_sequence):
+    tasks = []
+    if "move to red cube" in action_sequence:
+        tasks.append(("move", red_cube_pos))
+    if "grab red cube" in action_sequence:
+        tasks.append(("grab", None))
+    if "move to blue cylinder" in action_sequence:
+        tasks.append(("move", blue_cylinder_pos))
+    if "place red cube on blue cylinder" in action_sequence:
+        tasks.append(("place", None))
+    return tasks
+
+# Execute each parsed action
+def execute_action(action, params):
+    if action == "move":
+        # Move to the specified position (simplified)
+        p.setJointMotorControlArray(robotId, range(p.getNumJoints(robotId)), 
+                                    p.POSITION_CONTROL, targetPositions=params)
+    elif action == "grab":
+        print("Grabbing object")  # Placeholder for grabbing logic
+    elif action == "place":
+        print("Placing object")  # Placeholder for placing logic
+    else:
+        print("Unknown action")
+
+# Get camera image from PyBullet
+def get_camera_image():
+    width, height = 320, 240
+    view_matrix = p.computeViewMatrix([0, 0, 2], [0, 0, 0], [1, 0, 0])
+    proj_matrix = p.computeProjectionMatrixFOV(60, width/height, 0.1, 100)
+    _, _, rgba, _, _ = p.getCameraImage(width, height, view_matrix, proj_matrix)
+    rgb_array = np.array(rgba)[:, :, :3]
+    return Image.fromarray(rgb_array)
+
+# Analyze the scene using CLIP to verify task completion
+def analyze_scene_with_clip(image, text_query):
+    inputs = clip_processor(text=text_query, images=image, return_tensors="pt", padding=True)
+    outputs = clip_model(**inputs)
+    logits_per_image = outputs.logits_per_image
+    probs = logits_per_image.softmax(dim=1)
+    return probs.item()
+
+# Main loop
+def perform_task(input_command):
+    # Generate robot actions from input command
+    action_sequence = generate_robot_actions(input_command)
+    print("LLM Action Sequence:", action_sequence)
+
+    # Break down into smaller tasks
+    tasks = parse_actions(action_sequence)
+
+    # Execute and verify each task
+    for task, params in tasks:
+        execute_action(task, params)
+        p.stepSimulation()
+        time.sleep(1./240.)
+
+        # Capture the scene after each action
+        current_image = get_camera_image()
+
+        # Generate appropriate text input for CLIP based on the action
+        if task == "move":
+            clip_text = f"The robot has moved to the specified position."
+        elif task == "grab":
+            clip_text = f"The robot has grabbed the red cube."
+        elif task == "place":
+            clip_text = f"The red cube is placed on the blue cylinder."
+        
+        # Verify task completion with CLIP
+        completion_probability = analyze_scene_with_clip(current_image, clip_text)
+        print(f"Task completion probability for '{task}': {completion_probability:.2f}")
+
+        if completion_probability > 0.7:  # Threshold for success
+            print(f"Task '{task}' appears to be completed successfully!")
+        else:
+            print(f"Task '{task}' may not be completed yet. Adjust or retry.")
+    
+    print("Task sequence complete.")
+
+# Run the system
+user_input = "Pick up the red cube and place it on the blue cylinder"
+perform_task(user_input)
+
+p.disconnect()
