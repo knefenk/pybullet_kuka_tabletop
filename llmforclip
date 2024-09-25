@@ -5,25 +5,44 @@ import numpy as np
 from PIL import Image
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, CLIPProcessor, CLIPModel
+from huggingface_hub import login
 
-# PyBullet setup (as before)
+# Log in with your HuggingFace token
+login(token="your_huggingface_token", add_to_git_credential=True)
+
+# PyBullet setup (GUI and Physics)
 physicsClient = p.connect(p.GUI)
 p.setAdditionalSearchPath(pybullet_data.getDataPath())
 p.setGravity(0, 0, -9.81)
 
+# Load environment (plane, table, robot arm)
 planeId = p.loadURDF("plane.urdf")
 tableId = p.loadURDF("table/table.urdf", [0, 0, 0])
 robotStartPos = [0, 0, 0.6]
 robotStartOrientation = p.getQuaternionFromEuler([0, 0, 0])
 robotId = p.loadURDF("kuka_iiwa/model.urdf", robotStartPos, robotStartOrientation, useFixedBase=True)
 
+# Load gripper
+gripperId = p.loadURDF("gripper/robotiq_2f_85.urdf", [0, 0, 0.7], useFixedBase=True)
+
 # Set up LLaMA model for generating actions and descriptions
-llama_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B-Instruct")
-llama_model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3.1-8B-Instruct", torch_dtype=torch.float16, device_map="auto")
+llama_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+llama_model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3.1-8B", torch_dtype=torch.float16, device_map="auto")
 
 # Set up CLIP model for scene validation
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+# Spawn random colored cubes with known coordinates
+cube_positions = []
+colors = ["red", "blue", "green", "yellow"]
+for color in colors:
+    x = np.random.uniform(-0.2, 0.2)
+    y = np.random.uniform(-0.2, 0.2)
+    cube_positions.append([x, y, 0.05])
+    visual_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.02, 0.02, 0.02], rgbaColor=[np.random.random(), np.random.random(), np.random.random(), 1])
+    collision_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.02, 0.02, 0.02])
+    p.createMultiBody(1, collision_shape, visual_shape, basePosition=[x, y, 0.05])
 
 # Helper function to generate robot actions using LLaMA
 def generate_robot_action(input_text):
@@ -38,10 +57,15 @@ def generate_task_descriptions(task_text):
     outputs = llama_model.generate(**inputs, max_length=100)
     return llama_tokenizer.decode(outputs[0], skip_special_tokens=True).split(". ")
 
-# Simplified action parsing logic
+# Action parsing logic (based on user input and cube positions)
 def parse_action(action_text):
     if "move" in action_text.lower():
-        return "move", [0.1, 0.1, 0.1]  # Example: move to a fixed position
+        color = next((c for c in colors if c in action_text.lower()), None)
+        if color:
+            idx = colors.index(color)
+            return "move", cube_positions[idx]
+        else:
+            return "move", [0.1, 0.1, 0.1]  # Default move to center
     elif "grab" in action_text.lower():
         return "grab", None
     elif "release" in action_text.lower():
@@ -49,25 +73,29 @@ def parse_action(action_text):
     else:
         return "unknown", None
 
+# Function to execute the parsed actions
 def execute_action(action, params):
     if action == "move":
-        # Implement robot arm movement in PyBullet
+        # Move the robot arm to the target position
+        target_position = params
         p.setJointMotorControlArray(robotId, range(p.getNumJoints(robotId)), 
-                                    p.POSITION_CONTROL, targetPositions=params)
+                                    p.POSITION_CONTROL, targetPositions=target_position)
     elif action == "grab":
-        # Implement grabbing logic
+        # Close the gripper
+        p.setJointMotorControl2(gripperId, 1, p.POSITION_CONTROL, targetPosition=0.0)
         print("Grabbing object")
     elif action == "release":
-        # Implement releasing logic
+        # Open the gripper
+        p.setJointMotorControl2(gripperId, 1, p.POSITION_CONTROL, targetPosition=0.85)
         print("Releasing object")
     else:
         print("Unknown action")
 
-# Capture image from PyBullet environment
+# Capture image from PyBullet environment (with first-person view)
 def get_camera_image():
     width, height = 320, 240
-    view_matrix = p.computeViewMatrix([0, 0, 2], [0, 0, 0], [1, 0, 0])
-    proj_matrix = p.computeProjectionMatrixFOV(60, width/height, 0.1, 100)
+    view_matrix = p.computeViewMatrixFromYawPitchRoll([0, 0, 1], 1, 0, -89, 0, 2)
+    proj_matrix = p.computeProjectionMatrixFOV(60, width / height, 0.1, 100)
     _, _, rgba, _, _ = p.getCameraImage(width, height, view_matrix, proj_matrix)
     rgb_array = np.array(rgba)[:, :, :3]
     return Image.fromarray(rgb_array)
