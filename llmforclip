@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, CLIPProcessor, CLI
 from huggingface_hub import login
 
 # Log in with your token
-login(token="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", add_to_git_credential=True)
+login(token="access_token", add_to_git_credential=True)
 
 # PyBullet setup (as before)
 physicsClient = p.connect(p.GUI)
