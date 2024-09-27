@@ -16,7 +16,7 @@ from huggingface_hub import login
 
 
 # Log in with your token
-login(token="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", add_to_git_credential=True)
+login(token="accss_token", add_to_git_credential=True)
 # Load LLaMA model
 # Load model directly
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
