@@ -1,200 +1,98 @@
-import pybullet as p
-import pybullet_data
-import time
+import os
 import numpy as np
-from PIL import Image
+import pybullet as p
+from tqdm import tqdm
+import time
+import math
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, CLIPProcessor, CLIPModel
+from PIL import Image
+from transformers import LlamaTokenizer, LlamaForCausalLM, ViltProcessor, ViltForQuestionAnswering, AutoTokenizer, AutoModelForCausalLM
+
+from env import ClutteredPushGrasp
+from robot import UR5Robotiq85
+from utilities import YCBModels, Camera
+
 from huggingface_hub import login
 
+
 # Log in with your token
-login(token="access_token", add_to_git_credential=True)
+login(token="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", add_to_git_credential=True)
+# Load LLaMA model
+# Load model directly
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B")
 
-# PyBullet setup (as before)
-physicsClient = p.connect(p.GUI)
-p.setAdditionalSearchPath(pybullet_data.getDataPath())
-p.setGravity(0, 0, -9.81)
+# Load VLIT model
+vilt_processor = ViltProcessor.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
+vilt_model = ViltForQuestionAnswering.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
 
-planeId = p.loadURDF("plane.urdf")
-tableId = p.loadURDF("table/table.urdf", [0, 0, 0])
-robotStartPos = [0, 0, 0.6]
-robotStartOrientation = p.getQuaternionFromEuler([0, 0, 0])
-robotId = p.loadURDF("kuka_iiwa/model.urdf", robotStartPos, robotStartOrientation, useFixedBase=True)
+def generate_arm_instructions(prompt):
+    inputs = tokenizer(prompt, return_tensors="pt")
+    outputs = model.generate(**inputs, max_length=100)
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-# Gripper setup (assume gripper URDF is present)
-gripperId = p.loadURDF("simple_gripper.urdf", [0, 0, 0.6])
-p.createConstraint(robotId, 6, gripperId, -1, p.JOINT_FIXED, [0, 0, 0], [0, 0, 0], [0, 0, 0])
+def analyze_scene(image, question):
+    inputs = vilt_processor(image, question, return_tensors="pt")
+    outputs = vlit_model(**inputs)
+    logits = outputs.logits
+    predicted_answer = logits.argmax(-1).item()
+    return vilt_processor.decode(predicted_answer)
 
+def execute_arm_instructions(env, instructions):
+    actions = instructions.split(', ')
+    for action in actions:
+        if 'move' in action:
+            coords = action.split('to ')[1].strip('()').split(',')
+            x, y, z = map(float, coords)
+            # Assuming env.step() can handle position control
+            obs, reward, done, info = env.step([x, y, z, 1], 'end')  # 1 for gripper open
+        elif 'grip' in action:
+            if 'open' in action:
+                obs, reward, done, info = env.step([0, 0, 0, 1], 'end')  # Open gripper
+            elif 'close' in action:
+                obs, reward, done, info = env.step([0, 0, 0, 0], 'end')  # Close gripper
+        time.sleep(0.1)  # Add a small delay to allow for visualization
 
-def control_gripper(opening_distance):
-    # Control the prismatic joints for left and right fingers
-    p.setJointMotorControl2(gripperId, 0, p.POSITION_CONTROL, targetPosition=opening_distance)
-    p.setJointMotorControl2(gripperId, 1, p.POSITION_CONTROL, targetPosition=opening_distance)
-# Function to spawn cubes with random positions and colors
-cube_colors = ['red', 'blue', 'green', 'yellow']
-cube_positions = []
+def llama_vlit_control_demo():
+    ycb_models = YCBModels(
+        os.path.join('./data/ycb', '**', 'textured-decmp.obj'),
+    )
+    camera = Camera((1, 1, 1),
+                    (0, 0, 0),
+                    (0, 0, 1),
+                    0.1, 5, (320, 320), 40)
+    robot = UR5Robotiq85((0, 0.5, 0), (0, 0, 0))
+    env = ClutteredPushGrasp(robot, ycb_models, camera, vis=True)
+    env.reset()
 
-for i in range(4):  # Create 4 cubes
-    x = np.random.uniform(0.2, 0.5)
-    y = np.random.uniform(-0.2, 0.2)
-    z = 0.65  # Place the cubes on the table
-    cube_pos = [x, y, z]
-    cube_positions.append(cube_pos)
-    
-    cube_color = cube_colors[i % len(cube_colors)]
-    cube_visual = p.createVisualShape(shapeType=p.GEOM_BOX, rgbaColor=(np.random.rand(), np.random.rand(), np.random.rand(), 1))
-    cube_collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.05, 0.05, 0.05])
-    p.createMultiBody(baseMass=1, baseCollisionShapeIndex=cube_collision, baseVisualShapeIndex=cube_visual, basePosition=cube_pos)
-
-# First-person camera view
-def set_fpv_camera():
-    cam_position = p.getLinkState(robotId, 6)[0]  # Get the position of the end effector
-    view_matrix = p.computeViewMatrix(cam_position, [0, 0, 0], [0, 0, 1])  # First person view
-    proj_matrix = p.computeProjectionMatrixFOV(60, 1.0, 0.1, 100)
-    return view_matrix, proj_matrix
-
-# Set up LLaMA model for generating actions and descriptions
-llama_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
-llama_model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3.1-8B", torch_dtype=torch.float16, device_map="auto")   
-
-# Set up CLIP model for scene validation
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-
-# Helper function to generate robot actions using LLaMA
-def generate_robot_action(input_text):
-    inputs = llama_tokenizer(input_text, return_tensors="pt").to(llama_model.device)
-    outputs = llama_model.generate(**inputs, max_length=100)
-    return llama_tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-# New helper function to generate task validation descriptions using LLaMA
-def generate_task_descriptions(task_text):
-    prompt = f"Generate possible descriptions for: {task_text}"
-    inputs = llama_tokenizer(prompt, return_tensors="pt").to(llama_model.device)
-    outputs = llama_model.generate(**inputs, max_length=100)
-    return llama_tokenizer.decode(outputs[0], skip_special_tokens=True).split(". ")
-
-# Update parse_action to identify which cube to move
-def parse_action(action_text):
-    # Example: "Move the red cube to position [0.2, 0.1, 0.7]"
-    target_cube = None
-    for color in cube_colors:
-        if color in action_text.lower():
-            target_cube = color
+    while True:
+        # Capture image from the environment
+        rgb, depth, seg = env.render_camera()
+        scene_image = Image.fromarray(rgb)
+        
+        # Analyze the scene
+        scene_description = analyze_scene(scene_image, "What objects are in the scene?")
+        
+        # Generate instructions for the robot arm
+        prompt = f"Given the scene: {scene_description}, provide step-by-step instructions for the UR5 robot to pick up an object. Use actions like 'move to (x,y,z)', 'open grip', 'close grip'."
+        arm_instructions = generate_arm_instructions(prompt)
+        
+        print(f"Generated instructions: {arm_instructions}")
+        
+        # Execute the instructions
+        execute_arm_instructions(env, arm_instructions)
+        
+        # Get feedback
+        rgb, depth, seg = env.render_camera()
+        feedback_image = Image.fromarray(rgb)
+        feedback = analyze_scene(feedback_image, "Was the object successfully picked up?")
+        
+        print(f"Feedback: {feedback}")
+        
+        if input("Continue? (y/n): ").lower() != 'y':
             break
 
-    if target_cube:
-        cube_index = cube_colors.index(target_cube)
-        target_position = cube_positions[cube_index]
-        if "move" in action_text.lower():
-            return "move", target_position
-        elif "grab" in action_text.lower():
-            return "grab", target_position
-        elif "release" in action_text.lower():
-            return "release", target_position
-    return "unknown", None
+    env.close()
 
-# Execute actions including gripper control
-def execute_action(action, params):
-    if action == "move":
-        # Calculate inverse kinematics to get joint angles for target position
-        target_position = params
-        target_orientation = p.getQuaternionFromEuler([0, -math.pi, 0])  # End effector facing down
-        joint_positions = p.calculateInverseKinematics(robotId, 6, target_position, target_orientation)
-        
-        # Move the robot arm to the target position
-        for i in range(p.getNumJoints(robotId)):
-            p.setJointMotorControl2(robotId, i, p.POSITION_CONTROL, targetPosition=joint_positions[i])
-        
-        # Wait for the arm to reach the target position
-        for _ in range(100):
-            p.stepSimulation()
-            time.sleep(1./240.)
-    
-    elif action == "grab":
-        # Close the gripper gradually
-        for _ in range(100):
-            p.setJointMotorControl2(gripperId, 1, p.POSITION_CONTROL, targetPosition=0.0)
-            p.stepSimulation()
-            time.sleep(1./240.)
-        print("Grabbing object")
-    
-    elif action == "release":
-        # Open the gripper gradually
-        for _ in range(100):
-            p.setJointMotorControl2(gripperId, 1, p.POSITION_CONTROL, targetPosition=0.85)
-            p.stepSimulation()
-            time.sleep(1./240.)
-        print("Releasing object")
-    
-    else:
-        print("Unknown action")
-
-    # Check for collisions after each action
-    if p.getContactPoints(robotId):
-        print("Warning: Robot has collided with an object")
-
-# Capture image from PyBullet environment from FPV
-def get_camera_image():
-    width, height = 320, 240
-    view_matrix, proj_matrix = set_fpv_camera()  # Update to FPV
-    _, _, rgba, _, _ = p.getCameraImage(width, height, view_matrix, proj_matrix)
-    rgb_array = np.array(rgba)[:, :, :3]
-    return Image.fromarray(rgb_array)
-
-
-def analyze_scene_with_clip(image, descriptions):
-    probabilities = []
-    for description in descriptions:
-        inputs = clip_processor(text=description, images=image, return_tensors="pt", padding=True)
-        outputs = clip_model(**inputs)
-        logits_per_image = outputs.logits_per_image
-        probs = logits_per_image.softmax(dim=1)
-        probabilities.append(probs.item())
-    
-    return max(probabilities)
-
-
-# Main loop
-for _ in range(1000):
-    try:
-        user_input = input("Enter a command for the robot: ")
-        
-        # Generate robot action using LLaMA
-        llm_output = generate_robot_action(user_input)
-        print("LLM output:", llm_output)
-        
-        # Parse and execute action
-        action, params = parse_action(llm_output)
-        execute_action(action, params)
-        
-        # Step the simulation
-        p.stepSimulation()
-        time.sleep(1./240.)
-
-        # Get visual feedback from PyBullet
-        current_image = get_camera_image()
-        
-        # Generate multiple task descriptions for validation
-        task_descriptions = generate_task_descriptions(user_input)
-        print("Generated descriptions:", task_descriptions)
-        
-        # Analyze scene with CLIP using generated descriptions
-        completion_probability = analyze_scene_with_clip(current_image, task_descriptions)
-        
-        print(f"Task completion probability: {completion_probability:.2f}")
-
-        if completion_probability > 0.7:  # Adjust this threshold as needed
-            print("Task appears to be completed successfully!")
-        else:
-            print("Task may not be completed yet.")
-    
-    except p.error as e:
-        print(f"PyBullet error occurred: {e}")
-        # Optionally reset the simulation here
-    
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        # Optionally break the loop or reset the simulation here
-
-p.disconnect()
+if __name__ == '__main__':
+    llama_vlit_control_demo()
